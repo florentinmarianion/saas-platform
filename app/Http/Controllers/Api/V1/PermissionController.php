@@ -11,41 +11,39 @@ use App\Models\User;
 use App\Models\UserAppPermission;
 use App\Models\UserPlatformPermission;
 use App\Services\TenantContext;
-use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Symfony\Component\HttpFoundation\Response;
 
 class PermissionController extends Controller
 {
-    use AuthorizesRequests;
-
     public function __construct(
         private readonly TenantContext $context,
     ) {}
 
     // ── App Permissions ──────────────────────────────────────────────
 
-    public function appIndex(User $user, App $app): JsonResponse
+    public function appIndex(User $user, App $app): AnonymousResourceCollection
     {
-        $permissions = UserAppPermission::forContext(
-            userId:    $user->id,
-            companyId: $this->context->companyId(),
-            appId:     $app->id,
-        )->active()->get();
+        $permissions = UserAppPermission::where('user_id', $user->id)
+            ->where('company_id', $this->context->companyId())
+            ->where('app_id', $app->id)
+            ->active()
+            ->get();
 
-        return response()->json($permissions);
+        return \App\Http\Resources\V1\UserAppPermissionResource::collection($permissions);
     }
 
     public function grant(GrantPermissionRequest $request, User $user, App $app): JsonResponse
     {
         $this->authorize('permission.grant');
+
         $companyId  = $this->context->companyId();
         $permission = $request->permission;
 
-        // Validate permission is declared by the app
         if (!$app->declaresPermission($permission)) {
             return response()->json([
                 'message' => "Permission [{$permission}] is not declared by app [{$app->slug}].",
@@ -53,7 +51,6 @@ class PermissionController extends Controller
             ], Response::HTTP_UNPROCESSABLE_ENTITY);
         }
 
-        // Determine approval status based on sensitivity
         $approvalStatus = $app->isSensitivePermission($permission)
             ? 'pending'
             : 'auto_approved';
@@ -64,8 +61,8 @@ class PermissionController extends Controller
             $user, $app, $companyId, $permission,
             $approvalStatus, $newId, $request
         ): void {
-            // Archive current version if exists
-            $current = UserAppPermission::where('user_id', $user->id)
+            $current = DB::table('user_app_permissions')
+                ->where('user_id', $user->id)
                 ->where('company_id', $companyId)
                 ->where('app_id', $app->id)
                 ->where('permission', $permission)
@@ -73,12 +70,7 @@ class PermissionController extends Controller
                 ->lockForUpdate()
                 ->first();
 
-            if ($current !== null) {
-                $current->update(['next_id' => $newId]);
-            }
-
-            // Create new version
-            UserAppPermission::insert([
+            DB::table('user_app_permissions')->insert([
                 'id'              => $newId,
                 'user_id'         => $user->id,
                 'company_id'      => $companyId,
@@ -94,39 +86,50 @@ class PermissionController extends Controller
                 'next_id'         => null,
                 'created_at'      => now(),
             ]);
+
+            if ($current !== null) {
+                DB::table('user_app_permissions')
+                    ->where('id', $current->id)
+                    ->update(['next_id' => $newId]);
+            }
         });
 
-        $created = UserAppPermission::find($newId);
-
-        return response()->json($created, Response::HTTP_CREATED);
+        return response()->json(
+            UserAppPermission::find($newId),
+            Response::HTTP_CREATED
+        );
     }
 
     public function revoke(Request $request, User $user, App $app, string $permission): JsonResponse
     {
         $this->authorize('permission.revoke');
+
         $companyId = $this->context->companyId();
         $newId     = (string) Str::orderedUuid();
 
         DB::transaction(function () use (
             $user, $app, $companyId, $permission, $newId, $request
         ): void {
-            $current = UserAppPermission::where('user_id', $user->id)
+            $current = DB::table('user_app_permissions')
+                ->where('user_id', $user->id)
                 ->where('company_id', $companyId)
                 ->where('app_id', $app->id)
                 ->where('permission', $permission)
                 ->whereNull('next_id')
                 ->lockForUpdate()
-                ->firstOrFail();
+                ->first();
 
-            $current->update(['next_id' => $newId]);
+            if ($current === null) {
+                abort(404, 'Permission not found.');
+            }
 
-            UserAppPermission::insert([
+            DB::table('user_app_permissions')->insert([
                 'id'              => $newId,
                 'user_id'         => $user->id,
                 'company_id'      => $companyId,
                 'app_id'          => $app->id,
                 'permission'      => $permission,
-                'granted'         => false,  // explicit revoke
+                'granted'         => false,
                 'granted_by'      => $request->user()->id,
                 'approval_status' => 'auto_approved',
                 'valid_from'      => now(),
@@ -136,6 +139,10 @@ class PermissionController extends Controller
                 'next_id'         => null,
                 'created_at'      => now(),
             ]);
+
+            DB::table('user_app_permissions')
+                ->where('id', $current->id)
+                ->update(['next_id' => $newId]);
         });
 
         return response()->json(null, Response::HTTP_NO_CONTENT);
@@ -145,8 +152,8 @@ class PermissionController extends Controller
     {
         $companyId = $this->context->companyId();
 
-        // Walk the linked list from current version backwards
-        $history = UserAppPermission::where('user_id', $user->id)
+        $history = DB::table('user_app_permissions')
+            ->where('user_id', $user->id)
             ->where('company_id', $companyId)
             ->where('app_id', $app->id)
             ->where('permission', $permission)
@@ -158,6 +165,8 @@ class PermissionController extends Controller
 
     public function rollback(Request $request, User $user, App $app, string $permissionId): JsonResponse
     {
+        $this->authorize('permission.grant');
+
         $target    = UserAppPermission::findOrFail($permissionId);
         $companyId = $this->context->companyId();
         $newId     = (string) Str::orderedUuid();
@@ -165,7 +174,8 @@ class PermissionController extends Controller
         DB::transaction(function () use (
             $target, $user, $app, $companyId, $newId, $request
         ): void {
-            $current = UserAppPermission::where('user_id', $user->id)
+            $current = DB::table('user_app_permissions')
+                ->where('user_id', $user->id)
                 ->where('company_id', $companyId)
                 ->where('app_id', $app->id)
                 ->where('permission', $target->permission)
@@ -173,11 +183,7 @@ class PermissionController extends Controller
                 ->lockForUpdate()
                 ->first();
 
-            if ($current !== null) {
-                $current->update(['next_id' => $newId]);
-            }
-
-            UserAppPermission::insert([
+            DB::table('user_app_permissions')->insert([
                 'id'              => $newId,
                 'user_id'         => $user->id,
                 'company_id'      => $companyId,
@@ -193,6 +199,12 @@ class PermissionController extends Controller
                 'next_id'         => null,
                 'created_at'      => now(),
             ]);
+
+            if ($current !== null) {
+                DB::table('user_app_permissions')
+                    ->where('id', $current->id)
+                    ->update(['next_id' => $newId]);
+            }
         });
 
         return response()->json(['message' => 'Permission rolled back successfully.']);
@@ -200,13 +212,13 @@ class PermissionController extends Controller
 
     // ── Platform Permissions ─────────────────────────────────────────
 
-    public function platformIndex(User $user): JsonResponse
+    public function platformIndex(User $user): AnonymousResourceCollection
     {
         $permissions = UserPlatformPermission::where('user_id', $user->id)
             ->active()
             ->get();
 
-        return response()->json($permissions);
+        return \App\Http\Resources\V1\UserPlatformPermissionResource::collection($permissions);
     }
 
     public function grantPlatform(Request $request, User $user): JsonResponse
@@ -219,17 +231,14 @@ class PermissionController extends Controller
         $newId = (string) Str::orderedUuid();
 
         DB::transaction(function () use ($user, $request, $newId): void {
-            $current = UserPlatformPermission::where('user_id', $user->id)
+            $current = DB::table('user_platform_permissions')
+                ->where('user_id', $user->id)
                 ->where('permission', $request->permission)
                 ->whereNull('next_id')
                 ->lockForUpdate()
                 ->first();
 
-            if ($current !== null) {
-                $current->update(['next_id' => $newId]);
-            }
-
-            UserPlatformPermission::insert([
+            DB::table('user_platform_permissions')->insert([
                 'id'              => $newId,
                 'user_id'         => $user->id,
                 'permission'      => $request->permission,
@@ -242,6 +251,12 @@ class PermissionController extends Controller
                 'next_id'         => null,
                 'created_at'      => now(),
             ]);
+
+            if ($current !== null) {
+                DB::table('user_platform_permissions')
+                    ->where('id', $current->id)
+                    ->update(['next_id' => $newId]);
+            }
         });
 
         return response()->json(
@@ -255,15 +270,18 @@ class PermissionController extends Controller
         $newId = (string) Str::orderedUuid();
 
         DB::transaction(function () use ($user, $permission, $newId, $request): void {
-            $current = UserPlatformPermission::where('user_id', $user->id)
+            $current = DB::table('user_platform_permissions')
+                ->where('user_id', $user->id)
                 ->where('permission', $permission)
                 ->whereNull('next_id')
                 ->lockForUpdate()
-                ->firstOrFail();
+                ->first();
 
-            $current->update(['next_id' => $newId]);
+            if ($current === null) {
+                abort(404, 'Permission not found.');
+            }
 
-            UserPlatformPermission::insert([
+            DB::table('user_platform_permissions')->insert([
                 'id'              => $newId,
                 'user_id'         => $user->id,
                 'permission'      => $permission,
@@ -276,6 +294,10 @@ class PermissionController extends Controller
                 'next_id'         => null,
                 'created_at'      => now(),
             ]);
+
+            DB::table('user_platform_permissions')
+                ->where('id', $current->id)
+                ->update(['next_id' => $newId]);
         });
 
         return response()->json(null, Response::HTTP_NO_CONTENT);
